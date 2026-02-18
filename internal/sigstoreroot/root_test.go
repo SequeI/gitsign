@@ -15,11 +15,48 @@
 package sigstoreroot
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/sigstore/sigstore-go/pkg/tuf"
 )
+
+// setupFakeHome creates a temp HOME with a .sigstore/root cache directory.
+func setupFakeHome(t *testing.T) string {
+	t.Helper()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	cache := filepath.Join(fakeHome, ".sigstore", "root")
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return cache
+}
+
+// simulateDoInitialize reproduces the cache layout cosign's DoInitialize creates.
+func simulateDoInitialize(t *testing.T, cache, mirror string, rootBytes []byte) {
+	t.Helper()
+
+	remote := map[string]string{"mirror": mirror}
+	remoteBytes, err := json.Marshal(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "remote.json"), remoteBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mirrorDir := filepath.Join(cache, tuf.URLToPath(mirror))
+	if err := os.MkdirAll(mirrorDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mirrorDir, "root.json"), rootBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestTUFOptions(t *testing.T) {
 	opts := TUFOptions()
@@ -28,6 +65,99 @@ func TestTUFOptions(t *testing.T) {
 	}
 	if opts.CachePath == "" {
 		t.Fatal("TUFOptions() CachePath is empty")
+	}
+}
+
+func TestTUFOptionsCustomMirrorUsesCachedRoot(t *testing.T) {
+	cache := setupFakeHome(t)
+
+	customMirror := "https://tuf.custom.example.com"
+	customRoot := []byte(`{"signed":{"_type":"root","version":1},"signatures":[]}`)
+
+	simulateDoInitialize(t, cache, customMirror, customRoot)
+
+	opts := TUFOptions()
+
+	if opts.RepositoryBaseURL != customMirror {
+		t.Fatalf("RepositoryBaseURL = %q, want %q", opts.RepositoryBaseURL, customMirror)
+	}
+	if !bytes.Equal(opts.Root, customRoot) {
+		t.Fatal("expected cached custom root")
+	}
+	if bytes.Equal(opts.Root, tuf.DefaultRoot()) {
+		t.Fatal("root must differ from embedded default")
+	}
+}
+
+func TestTUFOptionsDefaultMirrorKeepsEmbeddedRoot(t *testing.T) {
+	setupFakeHome(t)
+
+	opts := TUFOptions()
+
+	if opts.RepositoryBaseURL != tuf.DefaultMirror {
+		t.Fatalf("RepositoryBaseURL = %q, want %q", opts.RepositoryBaseURL, tuf.DefaultMirror)
+	}
+	if !bytes.Equal(opts.Root, tuf.DefaultRoot()) {
+		t.Fatal("expected embedded default root")
+	}
+}
+
+func TestTUFOptionsCustomMirrorMissingCachedRootFallsBack(t *testing.T) {
+	cache := setupFakeHome(t)
+
+	customMirror := "https://tuf.custom.example.com"
+	remote := map[string]string{"mirror": customMirror}
+	remoteBytes, _ := json.Marshal(remote)
+	os.WriteFile(filepath.Join(cache, "remote.json"), remoteBytes, 0o600)
+
+	opts := TUFOptions()
+
+	if opts.RepositoryBaseURL != customMirror {
+		t.Fatalf("RepositoryBaseURL = %q, want %q", opts.RepositoryBaseURL, customMirror)
+	}
+	if !bytes.Equal(opts.Root, tuf.DefaultRoot()) {
+		t.Fatal("expected fallback to embedded default root")
+	}
+}
+
+func TestTUFOptionsCachePathMatchesDoInitialize(t *testing.T) {
+	cache := setupFakeHome(t)
+	customMirror := "https://tuf-server.test.svc:8443/rhtas"
+	customRoot := []byte(`{"signed":{"_type":"root","version":2},"signatures":[]}`)
+
+	simulateDoInitialize(t, cache, customMirror, customRoot)
+
+	expectedDir := filepath.Join(cache, tuf.URLToPath(customMirror))
+	expectedRootPath := filepath.Join(expectedDir, "root.json")
+	if _, err := os.Stat(expectedRootPath); err != nil {
+		t.Fatalf("cached root.json not found at expected path %q: %v", expectedRootPath, err)
+	}
+
+	opts := TUFOptions()
+	if !bytes.Equal(opts.Root, customRoot) {
+		t.Fatal("expected cached root.json from DoInitialize path")
+	}
+
+	tufClientDir := filepath.Join(opts.CachePath, tuf.URLToPath(opts.RepositoryBaseURL))
+	if tufClientDir != expectedDir {
+		t.Fatalf("TUF client cache dir %q != DoInitialize dir %q", tufClientDir, expectedDir)
+	}
+}
+
+func TestTUFOptionsCustomMirrorWithPortAndPath(t *testing.T) {
+	cache := setupFakeHome(t)
+
+	customMirror := "http://tuf.local:8080/v2/targets"
+	customRoot := []byte(`{"signed":{"_type":"root","version":1},"signatures":[]}`)
+
+	simulateDoInitialize(t, cache, customMirror, customRoot)
+
+	opts := TUFOptions()
+	if opts.RepositoryBaseURL != customMirror {
+		t.Fatalf("RepositoryBaseURL = %q, want %q", opts.RepositoryBaseURL, customMirror)
+	}
+	if !bytes.Equal(opts.Root, customRoot) {
+		t.Fatal("expected cached custom root for URL with port and path")
 	}
 }
 
